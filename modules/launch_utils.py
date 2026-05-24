@@ -489,6 +489,146 @@ def prepare_environment():
         git_pull_recursive(extensions_dir)
         startup_timer.record("update extensions")
 
+    # Dynamic hot-patch for diffusers 0.33.1 / transformers 5.x compatibility
+    try:
+        import site
+        paths = sys.path + (site.getsitepackages() if hasattr(site, "getsitepackages") else [])
+        for p in paths:
+            if not p:
+                continue
+            plu_path = os.path.join(p, "diffusers", "pipelines", "pipeline_loading_utils.py")
+            if os.path.exists(plu_path):
+                with open(plu_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                target = "from transformers.utils import FLAX_WEIGHTS_NAME as TRANSFORMERS_FLAX_WEIGHTS_NAME"
+                replacement = 'TRANSFORMERS_FLAX_WEIGHTS_NAME = "flax_model.msgpack"'
+                if target in content:
+                    print("[Patch] Hot-patching diffusers pipeline_loading_utils.py for transformers 5.x compatibility...")
+                    content = content.replace(target, replacement)
+                    with open(plu_path, "w", encoding="utf-8") as f:
+                        f.write(content)
+                    print("[Patch] Hot-patch applied successfully.")
+                    break
+    except Exception as e:
+        print(f"[Patch] Failed to apply hot-patch to diffusers: {e}")
+
+    # Dynamic hot-patch for gradio 4.40.0 / huggingface_hub >= 0.26.0 compatibility
+    try:
+        import huggingface_hub
+        if not hasattr(huggingface_hub, "HfFolder"):
+            print("[Patch] Dynamically injecting HfFolder into huggingface_hub...")
+            class DummyHfFolder:
+                @staticmethod
+                def get_token():
+                    try:
+                        return huggingface_hub.get_token()
+                    except Exception:
+                        return None
+                @staticmethod
+                def save_token(token):
+                    try:
+                        huggingface_hub.login(token=token)
+                    except Exception:
+                        pass
+                @staticmethod
+                def delete_token():
+                    try:
+                        huggingface_hub.logout()
+                    except Exception:
+                        pass
+            huggingface_hub.HfFolder = DummyHfFolder
+            sys.modules["huggingface_hub"].HfFolder = DummyHfFolder
+            print("[Patch] HfFolder successfully injected.")
+    except Exception as e:
+        print(f"[Patch] Failed to patch huggingface_hub: {e}")
+
+    # Dynamic hot-patch for transformers 5.x compatibility with no_init_weights
+    try:
+        import transformers.modeling_utils
+        if not hasattr(transformers.modeling_utils, "no_init_weights"):
+            print("[Patch] Dynamically injecting no_init_weights into transformers.modeling_utils...")
+            try:
+                from transformers.initialization import no_init_weights as real_no_init_weights
+                fn = real_no_init_weights
+                print("[Patch] Found real_no_init_weights in transformers.initialization.")
+            except ImportError:
+                import contextlib
+                @contextlib.contextmanager
+                def dummy_no_init_weights():
+                    yield
+                fn = dummy_no_init_weights
+                print("[Patch] Using dummy_no_init_weights.")
+            transformers.modeling_utils.no_init_weights = fn
+            sys.modules["transformers.modeling_utils"].no_init_weights = fn
+            print("[Patch] no_init_weights successfully injected.")
+    except Exception as e:
+        print(f"[Patch] Failed to patch transformers.modeling_utils: {e}")
+
+    # Dynamic hot-patch for CLIPTextModel text_model attribute under transformers 5.x
+    try:
+        from transformers.models.clip.modeling_clip import CLIPTextModel, CLIPTextModelWithProjection
+        if not hasattr(CLIPTextModel, "text_model"):
+            print("[Patch] Adding text_model property to CLIPTextModel...")
+            def _get_text_model(self):
+                # transformers 5.x: CLIPTextTransformer renamed, find by attr
+                for name, module in self.named_children():
+                    if hasattr(module, 'encoder') and hasattr(module, 'embeddings'):
+                        return module
+                return self
+            CLIPTextModel.text_model = property(_get_text_model)
+            print("[Patch] CLIPTextModel.text_model property successfully added.")
+        try:
+            import torch.nn as _nn
+            _orig_module_load = _nn.Module.load_state_dict
+            def _patched_module_load(self, state_dict, strict=True, assign=False):
+                if any("text_model" in k for k in state_dict.keys()):
+                    remapped = {}
+                    for k, v in state_dict.items():
+                        new_k = k.replace("transformer.text_model.", "transformer.")
+                        remapped[new_k] = v
+                    state_dict = remapped
+                return _orig_module_load(self, state_dict, strict=strict, assign=assign)
+            _nn.Module.load_state_dict = _patched_module_load
+            print("[Patch] torch.nn.Module.load_state_dict remapping patched.")
+        except Exception as e2:
+            print(f"[Patch] Failed to patch load_state_dict remap: {e2}")
+    except Exception as e:
+        print(f"[Patch] Failed to patch CLIPTextModel: {e}")
+
+    # Dynamic hot-patch for gradio_client.utils get_type / _json_schema_to_python_type boolean check under Python 3.13 / newer Pydantic
+    try:
+        import site
+        paths = sys.path + (site.getsitepackages() if hasattr(site, "getsitepackages") else [])
+        for p in paths:
+            if not p:
+                continue
+            gcu_path = os.path.join(p, "gradio_client", "utils.py")
+            if os.path.exists(gcu_path):
+                with open(gcu_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                
+                patched = False
+                target1 = "def get_type(schema: dict):\n    if \"const\" in schema:"
+                replacement1 = "def get_type(schema: dict):\n    if not isinstance(schema, dict):\n        return {}\n    if \"const\" in schema:"
+                if target1 in content:
+                    content = content.replace(target1, replacement1)
+                    patched = True
+                
+                target2 = "def _json_schema_to_python_type(schema: Any, defs) -> str:\n    \"\"\"Convert the json schema into a python type hint\"\"\"\n    if schema == {}:"
+                replacement2 = "def _json_schema_to_python_type(schema: Any, defs) -> str:\n    \"\"\"Convert the json schema into a python type hint\"\"\"\n    if isinstance(schema, bool):\n        return \"Any\"\n    if schema == {}:"
+                if target2 in content:
+                    content = content.replace(target2, replacement2)
+                    patched = True
+                
+                if patched:
+                    print("[Patch] Hot-patching gradio_client/utils.py to avoid TypeError/AttributeError on boolean schema...")
+                    with open(gcu_path, "w", encoding="utf-8") as f:
+                        f.write(content)
+                    print("[Patch] Gradio client hot-patch applied successfully.")
+                    break
+    except Exception as e:
+        print(f"[Patch] Failed to apply hot-patch to gradio_client: {e}")
+
     if "--exit" in sys.argv:
         print("Exiting because of --exit argument")
         exit(0)
